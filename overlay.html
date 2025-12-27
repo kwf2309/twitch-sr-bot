@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Song Request Overlay</title>
+  <style>
+    html, body { margin:0; padding:0; background:transparent; overflow:hidden; }
+    #player { width: 640px; height: 360px; }
+    /* If you want audio-only feel, you can hide video: */
+    /* #player { opacity: 0.01; } */
+  </style>
+</head>
+<body>
+  <div id="player"></div>
+
+  <script src="https://www.youtube.com/iframe_api"></script>
+  <script>
+    const wsUrl = (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
+    const ws = new WebSocket(wsUrl);
+
+    let player = null;
+    let currentVideoId = null;
+
+    function postEnded() {
+      fetch("/ended", { method: "POST" }).catch(() => {});
+    }
+
+    function loadVideo(videoId) {
+      currentVideoId = videoId;
+      if (!player) return;
+      player.loadVideoById(videoId);
+      player.playVideo();
+    }
+
+    ws.addEventListener("message", (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === "play") {
+        const videoId = msg.payload?.platformIds?.youtubeVideoId;
+        if (videoId) loadVideo(videoId);
+      }
+    });
+
+    window.onYouTubeIframeAPIReady = function() {
+      player = new YT.Player("player", {
+        height: "360",
+        width: "640",
+        playerVars: {
+          autoplay: 1,
+          controls: 0,
+          disablekb: 1,
+          modestbranding: 1,
+          rel: 0
+        },
+        events: {
+          onReady: () => {
+            // If a song is already playing when OBS loads, it’ll arrive via ws "play"
+          },
+          onStateChange: (event) => {
+            // ENDED = 0
+            if (event.data === 0) postEnded();
+          }
+        }
+      });
+    };
+  </script>
+</body>
+</html>
