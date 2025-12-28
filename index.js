@@ -210,20 +210,33 @@ async function startTwitch() {
   const info = await getTokenInfo(tokenStr);
   console.log("Token scopes:", info.scopes);
 
-  const authProvider = new RefreshingAuthProvider(
-    {
-      clientId: TWITCH_CLIENT_ID,
-      clientSecret: TWITCH_CLIENT_SECRET,
-      onRefresh: (newTokenData) => saveToken(newTokenData),
+  // ✅ multi-user RefreshingAuthProvider mode
+  const authProvider = new RefreshingAuthProvider({
+    clientId: TWITCH_CLIENT_ID,
+    clientSecret: TWITCH_CLIENT_SECRET,
+    onRefresh: (userId, newTokenData) => {
+      // we only store one broadcaster token file, so just overwrite it
+      saveToken(newTokenData);
     },
-    tokenData
-  );
+  });
 
+  // ✅ register this token as a user token in the provider
+  // This gives Twurple the required "user context" so channelPoints calls work.
+  const broadcasterUserId = await authProvider.addUserForToken(tokenData, scopes);
+
+  // ✅ Create ApiClient with the broadcaster user context
   const apiClient = new ApiClient({ authProvider });
 
+  // confirm broadcaster matches login
   const broadcaster = await apiClient.users.getUserByName(BROADCASTER_LOGIN);
   if (!broadcaster) throw new Error(`Broadcaster not found: ${BROADCASTER_LOGIN}`);
   console.log("Broadcaster ID:", broadcaster.id);
+
+  if (broadcasterUserId !== broadcaster.id) {
+    console.warn(
+      `Warning: token user (${broadcasterUserId}) != broadcaster user (${broadcaster.id}). Make sure you authorized the correct Twitch account.`
+    );
+  }
 
   // Connect to Twitch EventSub WebSocket (native)
   await connectEventSubWs({
@@ -235,19 +248,10 @@ async function startTwitch() {
 
 async function connectEventSubWs({ apiClient, broadcasterId, tokenStr }) {
   const ws = new WebSocket("wss://eventsub.wss.twitch.tv/ws");
-  let sessionId = null;
 
-  ws.on("open", () => {
-    console.log("EventSub WS connected.");
-  });
-
-  ws.on("close", (code, reason) => {
-    console.error("EventSub WS closed:", code, reason?.toString?.() || "");
-  });
-
-  ws.on("error", (err) => {
-    console.error("EventSub WS error:", err);
-  });
+  ws.on("open", () => console.log("EventSub WS connected."));
+  ws.on("close", (code, reason) => console.error("EventSub WS closed:", code, reason?.toString?.() || ""));
+  ws.on("error", (err) => console.error("EventSub WS error:", err));
 
   ws.on("message", async (raw) => {
     let msg;
@@ -260,10 +264,9 @@ async function connectEventSubWs({ apiClient, broadcasterId, tokenStr }) {
     const type = msg?.metadata?.message_type;
 
     if (type === "session_welcome") {
-      sessionId = msg.payload.session.id;
+      const sessionId = msg.payload.session.id;
       console.log("EventSub session id:", sessionId);
 
-      // Always use the latest token from disk (handles refresh)
       const latest = getLatestAccessToken() || tokenStr;
 
       await createRedemptionSubscription({
@@ -278,7 +281,6 @@ async function connectEventSubWs({ apiClient, broadcasterId, tokenStr }) {
 
     if (type === "notification") {
       const subType = msg?.payload?.subscription?.type;
-
       if (subType === "channel.channel_points_custom_reward_redemption.add") {
         const ev = msg.payload.event;
         await handleRedemptionEvent({ apiClient, broadcasterId, ev });
@@ -287,8 +289,7 @@ async function connectEventSubWs({ apiClient, broadcasterId, tokenStr }) {
     }
 
     if (type === "session_reconnect") {
-      const newUrl = msg.payload.session.reconnect_url;
-      console.log("EventSub told us to reconnect:", newUrl);
+      console.log("EventSub told us to reconnect:", msg.payload.session.reconnect_url);
       ws.close();
       return;
     }
@@ -336,7 +337,6 @@ async function handleRedemptionEvent({ apiClient, broadcasterId, ev }) {
   console.log("REWARD ID:", rewardId);
   console.log("INPUT:", input);
 
-  // lock to reward (optional)
   if (SONG_REQUEST_REWARD_ID && rewardId !== SONG_REQUEST_REWARD_ID) return;
 
   const setStatus = async (status) => {
