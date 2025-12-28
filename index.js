@@ -44,6 +44,12 @@ function saveToken(token) {
   fs.writeFileSync(TOKEN_FILE, JSON.stringify(token, null, 2), "utf8");
 }
 
+// Always fetch the newest access token from disk (in case it refreshed)
+function getLatestAccessToken() {
+  const t = loadToken();
+  return t?.accessToken || null;
+}
+
 // -------------------- SIMPLE QUEUE --------------------
 const queue = [];
 let nowPlaying = null;
@@ -65,7 +71,6 @@ function ytSearchOne(queryOrUrl) {
       queryOrUrl.startsWith("https://");
 
     const target = looksLikeUrl ? queryOrUrl : `ytsearch1:${queryOrUrl}`;
-
     const args = ["--dump-single-json", "--no-playlist", "--no-warnings", target];
 
     const proc = spawn("yt-dlp", args, { stdio: ["ignore", "pipe", "pipe"] });
@@ -176,7 +181,7 @@ app.get("/twitch/callback", async (req, res) => {
     if (!code) return res.status(400).send("Missing code");
 
     const token = await exchangeCode(TWITCH_CLIENT_ID, TWITCH_CLIENT_SECRET, code, redirectUri);
-    token.obtainmentTimestamp = Date.now(); // required for refresh logic
+    token.obtainmentTimestamp = Date.now();
 
     saveToken(token);
     console.log("Saved tokens to", TOKEN_FILE);
@@ -199,8 +204,10 @@ async function startTwitch() {
     return;
   }
 
+  const tokenStr = tokenData.accessToken;
+
   // validate token properly (access token string!)
-  const info = await getTokenInfo(tokenData.accessToken);
+  const info = await getTokenInfo(tokenStr);
   console.log("Token scopes:", info.scopes);
 
   const authProvider = new RefreshingAuthProvider(
@@ -218,17 +225,16 @@ async function startTwitch() {
   if (!broadcaster) throw new Error(`Broadcaster not found: ${BROADCASTER_LOGIN}`);
   console.log("Broadcaster ID:", broadcaster.id);
 
-  // Connect to Twitch EventSub WebSocket
+  // Connect to Twitch EventSub WebSocket (native)
   await connectEventSubWs({
-    authProvider,
     apiClient,
     broadcasterId: broadcaster.id,
+    tokenStr,
   });
 }
 
-async function connectEventSubWs({ authProvider, apiClient, broadcasterId }) {
+async function connectEventSubWs({ apiClient, broadcasterId, tokenStr }) {
   const ws = new WebSocket("wss://eventsub.wss.twitch.tv/ws");
-
   let sessionId = null;
 
   ws.on("open", () => {
@@ -237,7 +243,6 @@ async function connectEventSubWs({ authProvider, apiClient, broadcasterId }) {
 
   ws.on("close", (code, reason) => {
     console.error("EventSub WS closed:", code, reason?.toString?.() || "");
-    // Twitch expects you to reconnect. A simple restart is fine for now.
   });
 
   ws.on("error", (err) => {
@@ -258,9 +263,11 @@ async function connectEventSubWs({ authProvider, apiClient, broadcasterId }) {
       sessionId = msg.payload.session.id;
       console.log("EventSub session id:", sessionId);
 
-      // Create subscription for channel point redemptions
+      // Always use the latest token from disk (handles refresh)
+      const latest = getLatestAccessToken() || tokenStr;
+
       await createRedemptionSubscription({
-        authProvider,
+        tokenStr: latest,
         broadcasterId,
         sessionId,
       });
@@ -274,7 +281,6 @@ async function connectEventSubWs({ authProvider, apiClient, broadcasterId }) {
 
       if (subType === "channel.channel_points_custom_reward_redemption.add") {
         const ev = msg.payload.event;
-        // ev fields: id, broadcaster_user_id, user_id, user_login, user_name, user_input, reward{id,title,...}
         await handleRedemptionEvent({ apiClient, broadcasterId, ev });
       }
       return;
@@ -283,7 +289,6 @@ async function connectEventSubWs({ authProvider, apiClient, broadcasterId }) {
     if (type === "session_reconnect") {
       const newUrl = msg.payload.session.reconnect_url;
       console.log("EventSub told us to reconnect:", newUrl);
-      // simplest: close and let your process restart manually; or implement reconnect
       ws.close();
       return;
     }
@@ -295,21 +300,12 @@ async function connectEventSubWs({ authProvider, apiClient, broadcasterId }) {
   });
 }
 
-async function createRedemptionSubscription({ authProvider, broadcasterId, sessionId }) {
-  // get a fresh access token from the auth provider
-  const accessToken = await authProvider.getAccessToken();
-  const tokenStr = typeof accessToken === "string" ? accessToken : accessToken.accessToken;
-
+async function createRedemptionSubscription({ tokenStr, broadcasterId, sessionId }) {
   const body = {
     type: "channel.channel_points_custom_reward_redemption.add",
     version: "1",
-    condition: {
-      broadcaster_user_id: broadcasterId,
-    },
-    transport: {
-      method: "websocket",
-      session_id: sessionId,
-    },
+    condition: { broadcaster_user_id: broadcasterId },
+    transport: { method: "websocket", session_id: sessionId },
   };
 
   const r = await fetch("https://api.twitch.tv/helix/eventsub/subscriptions", {
@@ -340,14 +336,10 @@ async function handleRedemptionEvent({ apiClient, broadcasterId, ev }) {
   console.log("REWARD ID:", rewardId);
   console.log("INPUT:", input);
 
-  // Set SONG_REQUEST_REWARD_ID to lock it down (optional)
-  if (SONG_REQUEST_REWARD_ID && rewardId !== SONG_REQUEST_REWARD_ID) {
-    return;
-  }
+  // lock to reward (optional)
+  if (SONG_REQUEST_REWARD_ID && rewardId !== SONG_REQUEST_REWARD_ID) return;
 
-  // helper to set status
   const setStatus = async (status) => {
-    // Twurple Helix helper
     await apiClient.channelPoints.updateRedemptionStatusByIds(
       broadcasterId,
       rewardId,
@@ -356,44 +348,25 @@ async function handleRedemptionEvent({ apiClient, broadcasterId, ev }) {
     );
   };
 
-  // empty input => refund
-  if (!input) {
-    await setStatus("CANCELED");
-    return;
-  }
+  if (!input) return setStatus("CANCELED");
+  if (!canRequest(userId)) return setStatus("CANCELED");
 
-  // cooldown => refund
-  if (!canRequest(userId)) {
-    await setStatus("CANCELED");
-    return;
-  }
-
-  // resolve youtube
   let resolved;
   try {
     resolved = await ytSearchOne(input);
   } catch {
-    await setStatus("CANCELED");
-    return;
+    return setStatus("CANCELED");
   }
 
   const { videoId, title, durationSec } = resolved;
 
-  // duration cap => refund
-  if (durationSec && durationSec > maxDuration) {
-    await setStatus("CANCELED");
-    return;
-  }
+  if (durationSec && durationSec > maxDuration) return setStatus("CANCELED");
 
-  // duplicates => refund
   const already =
     nowPlaying?.platformIds?.youtubeVideoId === videoId ||
     queue.some((q) => q.platformIds.youtubeVideoId === videoId);
 
-  if (already) {
-    await setStatus("CANCELED");
-    return;
-  }
+  if (already) return setStatus("CANCELED");
 
   lastRequestAt.set(userId, Date.now());
 
@@ -409,7 +382,6 @@ async function handleRedemptionEvent({ apiClient, broadcasterId, ev }) {
 
   queue.push(item);
 
-  // accept redemption
   await setStatus("FULFILLED");
 
   broadcast("state", makeState());
