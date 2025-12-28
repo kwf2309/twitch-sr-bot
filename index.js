@@ -339,14 +339,37 @@ async function handleRedemptionEvent({ apiClient, broadcasterId, ev }) {
 
   if (SONG_REQUEST_REWARD_ID && rewardId !== SONG_REQUEST_REWARD_ID) return;
 
-  const setStatus = async (status) => {
-    await apiClient.channelPoints.updateRedemptionStatusByIds(
-      broadcasterId,
-      rewardId,
-      [redemptionId],
-      status
-    );
-  };
+    const setStatus = async (status) => {
+    try {
+        const accessToken = getLatestAccessToken(); // reads tokens.json
+
+        const url = new URL("https://api.twitch.tv/helix/channel_points/custom_rewards/redemptions");
+        url.searchParams.set("broadcaster_id", broadcasterId);
+        url.searchParams.set("reward_id", rewardId);
+        url.searchParams.set("id", redemptionId);
+
+        const r = await fetch(url.toString(), {
+        method: "PATCH",
+        headers: {
+            "Client-Id": TWITCH_CLIENT_ID,
+            Authorization: `Bearer ${accessToken}`,
+            "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ status }), // "FULFILLED" or "CANCELED"
+        });
+
+        const txt = await r.text();
+        if (!r.ok) {
+        console.error("Helix PATCH failed:", r.status, txt);
+        return false;
+        }
+        return true;
+    } catch (e) {
+        console.error("Helix PATCH exception:", e?.message || e);
+        return false;
+    }
+    };
+
 
   if (!input) return setStatus("CANCELED");
   if (!canRequest(userId)) return setStatus("CANCELED");
